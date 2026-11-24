@@ -50,6 +50,7 @@ p{margin:10px 0}
 <section id="live">
  <div class="sc"><table id="tb"></table></div>
  <p class="mu">Cells show turnover % the way CEXScan does: the window’s volume scaled up to a full day, divided by market cap. Market cap here is circulating supply from CoinGecko times the live Binance price, so it can differ a little from CEXScan. Amber cells pass Tier A, blue cells pass Tier B. 15m% and 4h% are recent price moves, and ↑Low% is how far price is above its 12h low. Coins that exceed your pump-filter limits (see Settings) are hidden, and the status line shows how many. Keep this tab open and the screen awake.</p>
+<p class="mu" id="skp"></p>
 </section>
 
 <section id="log" hidden>
@@ -69,7 +70,7 @@ p{margin:10px 0}
 <script>
 const $=s=>document.querySelector(s);
 const API='https://api.binance.com/api/v3';
-const DEF={top:150,minVol:0.2,every:60,aS:70,aL:20,bS:40,bL:10,nS:2,nL:3,minV:0,max15:2,maxMv:4,maxUp:8,max24:10,alert:1};
+const DEF={top:600,minVol:0,pre:3,every:60,aS:70,aL:20,bS:40,bL:10,nS:2,nL:3,minV:0,max15:2,maxMv:4,maxUp:8,max24:10,alert:1,ex:'MUB,SNDKB,CRCLB,NVDAB,TSLAB,ALABB,ASMLB,ASTSB,BMNRB,COHRB,CRDOB,IRENB,NFLXB,SMCIB,USARB,AMDB,EWYB,INTCB,MSTRB,CBRSB,COINB,DRAMB,GLWB,GOOGLB,SPYB,SPCXB'};
 function ld(k,d){try{const v=JSON.parse(localStorage.getItem(k));return v==null?d:v}catch(e){return d}}
 function sv(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
 let S=Object.assign({},DEF,ld('mm_set',{}));
@@ -94,13 +95,14 @@ async function pool(items,n,fn){
  return out;
 }
 const WM={'1m':1,'5m':5,'15m':15,'1h':60,'4h':240,'8h':480,'12h':720};
-let SUP=ld('mm_sup',{t:0,m:{}});
+const NP=10;let SKIP=[],CHK=0;
+let SUP=ld('mm_sup2',{t:0,m:{}});
 const sup=b=>SUP.m[b]||(/^1000/.test(b)&&SUP.m[b.slice(4)]/1000)||0;
 async function supply(){
  if(Date.now()-SUP.t<12*36e5&&Object.keys(SUP.m).length>500)return;
  const m={};let ok=0;
- for(let p=1;p<=8;p++){
-  $('#st').textContent='Loading market caps from CoinGecko, page '+p+' of 8…';
+ for(let p=1;p<=NP;p++){
+  $('#st').textContent='Loading market caps from CoinGecko, page '+p+' of '+NP+'…';
   try{
    const a=await jf('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page='+p);
    a.forEach(c=>{const k=String(c.symbol).toUpperCase();if(!m[k]&&c.circulating_supply>0)m[k]=c.circulating_supply});
@@ -108,29 +110,46 @@ async function supply(){
   }catch(e){break}
   await new Promise(r=>setTimeout(r,3500));
  }
- if(ok===8){SUP={t:Date.now(),m};sv('mm_sup',SUP)}
+ if(ok===NP){SUP={t:Date.now(),m};sv('mm_sup2',SUP)}
  else if(!Object.keys(SUP.m).length){
   if(Object.keys(m).length<100)throw new Error('CoinGecko market caps did not load, retrying next scan');
   SUP={t:1,m};
  }
 }
+async function win(syms,w){
+ const ch=[];for(let i=0;i<syms.length;i+=100)ch.push(syms.slice(i,i+100));
+ const parts=await Promise.all(ch.map(c=>jf(API+'/ticker?windowSize='+w+'&symbols='+encodeURIComponent(JSON.stringify(c)))));
+ const out={};parts.flat().forEach(r=>{out[r.symbol]=r});
+ return out;
+}
 async function build(){
  await supply();
  const all=await jf(API+'/ticker/24hr');
  const base=s=>s.slice(0,-4);
- const c=all.filter(t=>t.symbol.endsWith('USDT')&&!STABLE.test(t.symbol)&&sup(base(t.symbol))&&+t.quoteVolume>=S.minVol*1e6)
-  .sort((a,b)=>b.quoteVolume-a.quoteVolume).slice(0,S.top);
- const syms=c.map(t=>t.symbol).concat('BTCUSDT');
- const chunks=[];for(let i=0;i<syms.length;i+=100)chunks.push(syms.slice(i,i+100));
+ const EX=new Set(String(S.ex).toUpperCase().split(/[\s,]+/).filter(Boolean));
+ SKIP=[];
+ const c=all.filter(t=>{
+  const b=base(t.symbol);
+  if(!t.symbol.endsWith('USDT')||STABLE.test(t.symbol)||EX.has(b)||+t.quoteVolume<=0||+t.quoteVolume<S.minVol*1e6)return false;
+  if(!sup(b)){SKIP.push(b);return false}
+  t.t24=+t.quoteVolume/(+t.lastPrice*sup(b))*100;
+  return t.t24>=S.pre;
+ }).sort((a,b)=>b.t24-a.t24).slice(0,S.top);
  const W={};
- await Promise.all(SW.map(async w=>{
-  const rows=[];
-  for(const ch of chunks)rows.push(...await jf(API+'/ticker?windowSize='+w+'&symbols='+encodeURIComponent(JSON.stringify(ch))));
-  W[w]=Object.fromEntries(rows.map(r=>[r.symbol,r]));
- }));
+ CHK=c.length;
+ let list=c;
+ const tn=(w,t)=>{const q=W[w][t.symbol];return q?+q.quoteVolume*1440/WM[w]/(+t.lastPrice*sup(base(t.symbol)))*100:0};
+ if(S.nS>=2){
+  const sy=c.map(t=>t.symbol);
+  [W['5m'],W['15m']]=await Promise.all([win(sy,'5m'),win(sy,'15m')]);
+  const lim=Math.min(S.aS,S.bS);
+  list=c.map(t=>({t,k:Math.max(tn('5m',t),tn('15m',t))})).filter(o=>o.k>=lim).sort((a,b)=>b.k-a.k).slice(0,100).map(o=>o.t);
+ }else list=c.slice(0,100);
+ const s2=list.map(t=>t.symbol).concat('BTCUSDT');
+ await Promise.all(SW.filter(w=>!W[w]).map(async w=>{W[w]=await win(s2,w)}));
  const bt=W['4h']['BTCUSDT'];
  if(bt){const v=+bt.priceChangePercent;btc=v>0.5?'up':v<-0.5?'down':'range'}
- return c.map(t=>{
+ return list.map(t=>{
   const s=t.symbol,p=+t.lastPrice,mc=p*sup(base(s));
   const r={},vol={},ch={};
   for(const w of SW){
@@ -201,7 +220,7 @@ async function scan(){
   }
   LOG=LOG.slice(0,2000);sv('mm_log',LOG);
   const nA=res.filter(x=>x.tier==='A').length,nB=res.filter(x=>x.tier==='B').length;
-  $('#st').textContent='Last scan '+new Date().toLocaleTimeString('en-GB',{timeZone:'Asia/Karachi'})+' PKT. '+res.length+' coins, '+nA+' in A, '+nB+' in B, '+hid+' hidden (already pumped). BTC '+btc+'.';
+  $('#st').textContent='Last scan '+new Date().toLocaleTimeString('en-GB',{timeZone:'Asia/Karachi'})+' PKT. '+CHK+' coins checked, '+res.length+' active, '+nA+' in A, '+nB+' in B, '+hid+' hidden (already pumped), '+SKIP.length+' skipped (no market cap). BTC '+btc+'.';
   renderLive();renderLog();
  }catch(e){
   $('#st').textContent='Scan failed ('+e.message+'). Will retry.';
@@ -222,6 +241,7 @@ function renderLive(){
    SW.map(w=>{const v=x.r[w];return '<td class="'+(v>=th(w,'A')?'a':v>=th(w,'B')?'b':'')+'">'+(v>=100?v.toFixed(0):v.toFixed(1))+'</td>'}).join('')+'</tr>';
  }
  $('#tb').innerHTML=h;
+ $('#skp').textContent=SKIP.length?'Skipped, no market cap found on CoinGecko: '+SKIP.join(', ')+'.':'';
 }
 function renderLog(){
  const A=Array(24).fill(0),B=Array(24).fill(0),P=Array(24).fill(0),N=Array(24).fill(0);
@@ -238,17 +258,18 @@ function renderLog(){
  $('#hits').innerHTML=LOG.slice(0,40).map(l=>'<div class="hit"><span><b>'+nm(l.s)+'</b> <span class="mu">'+fmtT(l.t)+' PKT, BTC '+l.btc+'</span></span><span class="g">+'+(l.mx||0).toFixed(1)+'%</span><span class="tg '+l.tier+'">'+l.tier+'</span></div>').join('');
 }
 function buildForm(){
- const FM=[['top','Coins scanned (top by 24h volume)'],['minVol','Min 24h volume ($M)'],['every','Scan every (seconds)'],
+ const FM=[['top','Max coins checked per scan (highest 24h turnover first)'],['minVol','Min 24h volume ($M), 0 = all coins'],['pre','Speed filter: min 24h turnover % (lower checks more coins and uses more Binance quota)'],['every','Scan every (seconds)'],
   ['aS','Tier A turnover % for 1m, 5m, 15m (all must pass)'],['aL','Tier A turnover % for 1h, 4h, 8h, 12h (all must pass)'],
   ['bS','Tier B turnover % for 1m, 5m, 15m'],['bL','Tier B turnover % for 1h, 4h, 8h, 12h'],
   ['nS','Tier B: short windows that must pass (of 3)'],['nL','Tier B: long windows that must pass (of 4)'],
   ['minV','Min traded volume in last 15m ($), 0 = off'],['max15','Pump filter: max price move in last 15m (%)'],['maxMv','Pump filter: max move in last 4h (%)'],['maxUp','Pump filter: max rise above 12h low (%)'],['max24','Pump filter: max 24h change (%)']];
  $('#form').innerHTML=FM.map(([k,t])=>'<label class="f"><span>'+t+'</span><input type="number" step="any" data-k="'+k+'" value="'+S[k]+'"></label>').join('')+
+  '<label class="f" style="flex-direction:column;align-items:stretch"><span>Excluded coins (bStocks etc., comma separated)</span><input type="text" id="ex" value="'+S.ex+'" style="background:var(--pn);color:var(--tx);border:1px solid var(--ln);border-radius:6px;padding:6px 8px;font:inherit"></label>'+
   '<label class="f"><span>Alerts for Tier A (sound, vibration, notification)</span><input type="checkbox" id="al"'+(S.alert?' checked':'')+'></label>';
 }
 $('#save').onclick=()=>{
  document.querySelectorAll('[data-k]').forEach(i=>{const v=parseFloat(i.value);S[i.dataset.k]=isNaN(v)?DEF[i.dataset.k]:v});
- S.top=Math.min(250,Math.max(10,S.top));S.alert=$('#al').checked?1:0;
+ S.top=Math.min(250,Math.max(10,S.top));S.alert=$('#al').checked?1:0;S.ex=$('#ex').value;
  sv('mm_set',S);buildForm();renderLive();
  $('#st').textContent='Settings saved. They apply from the next scan.';
 };
